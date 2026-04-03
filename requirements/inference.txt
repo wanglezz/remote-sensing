@@ -1,0 +1,17 @@
+# 推理环境依赖
+# 昇腾 NPU 依赖 (需要在昇腾环境中安装)
+# 以下依赖通过 Ascend CANN  toolkit 提供，不需要 pip 安装
+# - ascendcl
+# - acl_python
+
+# 通用推理依赖
+numpy>=1.24.0
+opencv-python>=4.8.0
+pyyaml>=6.0
+pillow>=9.5.0
+
+# ONNX Runtime (可选，用于 CPU/GPU 验证)
+# onnxruntime-gpu>=1.15.0
+
+# 工具
+tqdm>=4.65.0

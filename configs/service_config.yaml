@@ -1,0 +1,38 @@
+# gRPC 服务配置
+
+# 服务器配置
+server:
+  host: 0.0.0.0
+  port: 50051
+  max_workers: 10
+  graceful_shutdown: 5  # 优雅关闭超时 (秒)
+
+# gRPC 配置
+grpc:
+  max_message_length: 52428800  # 50MB
+  keepalive_time_ms: 7200000
+  keepalive_timeout_ms: 20000
+  max_concurrent_streams: 100
+
+# 推理配置
+inference:
+  # 与 npu_inference_config.yaml 保持一致
+  conf_thres: 0.25
+  iou_thres: 0.7
+  max_det: 300
+
+# 日志配置
+logging:
+  level: INFO
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+  file: ./logs/service.log
+
+# 监控配置
+monitoring:
+  enabled: true
+  prometheus_port: 9090
+
+# 限流配置
+rate_limit:
+  enabled: false
+  requests_per_second: 100

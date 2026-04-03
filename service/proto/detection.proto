@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package detection;
+
+// 检测服务接口定义
+
+// 请求消息
+message DetectionRequest {
+    // 图像数据 (base64 编码的 JPEG/PNG)
+    bytes image_data = 1;
+
+    // 或者图像路径 (如果服务端可以访问共享存储)
+    string image_path = 2;
+
+    // 推理参数
+    float confidence_threshold = 3;
+    float iou_threshold = 4;
+    int32 max_detections = 5;
+}
+
+// 单个检测结果
+message Detection {
+    // 边界框 [cx, cy, w, h, angle]
+    repeated float box = 1;
+
+    // 置信度
+    float confidence = 2;
+
+    // 类别 ID
+    int32 class_id = 3;
+
+    // 类别名称
+    string class_name = 4;
+}
+
+// 响应消息
+message DetectionResponse {
+    // 检测结果列表
+    repeated Detection detections = 1;
+
+    // 处理时间 (毫秒)
+    float latency_ms = 2;
+
+    // 错误信息
+    string error_message = 3;
+
+    // 图像尺寸
+    int32 image_width = 4;
+    int32 image_height = 5;
+}
+
+// 健康检查请求
+message HealthCheckRequest {}
+
+// 健康检查响应
+message HealthCheckResponse {
+    bool healthy = 1;
+    string version = 2;
+    string status = 3;
+}
+
+// 批量检测请求
+message BatchDetectionRequest {
+    repeated DetectionRequest requests = 1;
+}
+
+// 批量检测响应
+message BatchDetectionResponse {
+    repeated DetectionResponse responses = 1;
+    float total_latency_ms = 2;
+}
+
+// 服务定义
+service DetectionService {
+    // 单次检测
+    rpc Detect(DetectionRequest) returns (DetectionResponse);
+
+    // 批量检测
+    rpc BatchDetect(BatchDetectionRequest) returns (BatchDetectionResponse);
+
+    // 健康检查
+    rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+
+    // 流式检测
+    rpc StreamingDetect(stream DetectionRequest) returns (stream DetectionResponse);
+}

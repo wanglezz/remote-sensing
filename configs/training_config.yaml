@@ -1,0 +1,97 @@
+# YOLO-OBB 训练配置
+
+# 数据集配置
+data:
+  dataset_name: DOTA
+  dataset_root: ./data/datasets/DOTA
+  train_images: ./data/datasets/DOTA/train/images
+  train_labels: ./data/datasets/DOTA/train/labels
+  val_images: ./data/datasets/DOTA/val/images
+  val_labels: ./data/datasets/DOTA/val/labels
+
+  # 类别定义 (DOTA v1.0 15 类)
+  names:
+    - plane
+    - baseball-diamond
+    - bridge
+    - ground-track-field
+    - small-vehicle
+    - large-vehicle
+    - ship
+    - tennis-court
+    - basketball-court
+    - storage-tank
+    - soccer-ball-field
+    - roundabout
+    - harbor
+    - swimming-pool
+    - helicopter
+  nc: 15  # 类别数量
+
+# 模型配置
+model:
+  architecture: yolov8n-obb  # YOLO-OBB-v8n
+  pretrained: true
+  backbone: c2f
+
+# 训练超参数
+train:
+  # 基础参数
+  imgsz: 1024  # 输入图像尺寸 (DOTA 推荐 1024)
+  batch_size: 16
+  epochs: 100
+  device: 0  # GPU ID
+
+  # 优化器
+  optimizer: SGD
+  lr0: 0.01  # 初始学习率
+  lrf: 0.1  # 最终学习率 (lr0 * lrf)
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3.0
+  warmup_momentum: 0.8
+
+  # 数据增强
+  augment:
+    hsv_h: 0.015  # 色调增强
+    hsv_s: 0.7    # 饱和度增强
+    hsv_v: 0.4    # 亮度增强
+    rotation: 90  # 旋转角度
+    scale: 0.5    # 缩放比例
+    translate: 0.1  # 平移比例
+    mosaic: 1.0   # Mosaic 增强概率
+    mixup: 0.0    # Mixup 增强概率
+
+  # 正负样本匹配
+  box: 7.5      # box loss gain
+  cls: 0.5      # cls loss gain
+  dfl: 1.5      # dfl loss gain
+
+  # 其他
+  amp: true     # 自动混合精度
+  patience: 50  # 早停 patience
+  save_period: 10  # 保存 checkpoint 周期
+
+# 验证配置
+val:
+  batch_size: 16
+  imgsz: 1024
+  save_json: false
+  save_hybrid: false
+
+  # 评估指标
+  iou_thres: 0.5  # mAP@0.5
+  conf_thres: 0.001
+  iou_thres_nms: 0.7
+
+  # 目标指标
+  target_mAP50: 0.80
+  target_precision: 0.90
+
+# 检查点配置
+checkpoint:
+  save_dir: ./models/training/runs
+  project: DOTA_OBB
+  name: train
+  exist_ok: false
+  resume: false  # 是否从 checkpoint 恢复

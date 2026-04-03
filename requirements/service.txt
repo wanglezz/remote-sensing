@@ -1,0 +1,20 @@
+# 服务环境依赖
+# gRPC
+grpcio>=1.59.0
+grpcio-tools>=1.59.0
+
+# 推理依赖 (复用 inference.txt)
+numpy>=1.24.0
+opencv-python>=4.8.0
+pyyaml>=6.0
+pillow>=9.5.0
+
+# Web 服务 (可选，用于健康检查)
+fastapi>=0.104.0
+uvicorn>=0.24.0
+
+# 监控
+prometheus-client>=0.19.0
+
+# 日志
+python-json-logger>=2.0.0
