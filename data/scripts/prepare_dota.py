@@ -1,55 +1,84 @@
 """
 DOTA 数据集预处理脚本
 
-将 DOTA 原始标注格式转换为 YOLO-OBB 格式
-原始格式：x1 y1 x2 y2 x3 y4 x4 y5 class_name difficulty
-YOLO-OBB 格式：class_id cx cy w h angle (归一化)
+将 DOTA 原始标注格式转换为 YOLOv8-OBB 格式
+原始格式：x1 y1 x2 y2 x3 y3 x4 y4 class_name difficulty
+YOLOv8-OBB 格式：class_id x1 y1 x2 y2 x3 y3 x4 y4（归一化，四顶点）
+
+对齐 data_prepare.py：
+  - 输入：RAW_IMAGE_DIR（大图）+ RAW_LABEL_DIR（labelTxt 标注）
+  - 输出：OUTPUT_DIR/images/{train,val,test} + labels/{train,val,test} + data.yaml
+  - 标注格式：四顶点归一化（而非 cx cy w h angle）
+  - 类别映射顺序与 data_prepare.py 一致
+  - 滑窗切图（crop_size=1024, stride=512，50% 重叠）
+  - 图像保存为 .jpg
+  - 随机划分 train/val/test（7:2:1）
 """
 
 import os
 import cv2
 import numpy as np
-from pathlib import Path
-from typing import List, Tuple, Dict
-from PIL import Image
 import shutil
+import yaml
+import random
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple
+from tqdm import tqdm
 
 
-# DOTA 类别映射
-DOTA_CLASSES = [
-    'plane',
-    'baseball-diamond',
-    'bridge',
-    'ground-track-field',
-    'small-vehicle',
-    'large-vehicle',
-    'ship',
-    'tennis-court',
-    'basketball-court',
-    'storage-tank',
-    'soccer-ball-field',
-    'roundabout',
-    'harbor',
-    'swimming-pool',
-    'helicopter'
-]
+# ══════════════════════════════════════════════════
+#  全局路径配置（与 data_prepare.py 保持一致）
+# ══════════════════════════════════════════════════
+RAW_IMAGE_DIR = "/data/fcj/raw_data/images"    # 原始大图目录
+RAW_LABEL_DIR = "/data/fcj/raw_data/labelTxt"  # DOTA 标注目录
+OUTPUT_DIR    = "/data/fcj/output"             # 输出根目录
 
-CLASS_TO_ID = {cls: idx for idx, cls in enumerate(DOTA_CLASSES)}
+# ══════════════════════════════════════════════════
+#  类别映射（与 data_prepare.py 保持一致）
+# ══════════════════════════════════════════════════
+CATEGORY_MAP = {
+    "plane":              0,
+    "ship":               1,
+    "storage-tank":       2,
+    "baseball-diamond":   3,
+    "tennis-court":       4,
+    "basketball-court":   5,
+    "ground-track-field": 6,
+    "harbor":             7,
+    "bridge":             8,
+    "large-vehicle":      9,
+    "small-vehicle":      10,
+    "helicopter":         11,
+    "roundabout":         12,
+    "soccer-ball-field":  13,
+    "swimming-pool":      14,
+}
+
+# 若只关注部分类别，在此过滤（None = 保留全部）
+KEEP_CLASSES: Optional[set] = None  # 例如: {"plane", "ship"}
+
+# 训练/验证/测试划分比例
+SPLIT_RATIO = {"train": 0.7, "val": 0.2, "test": 0.1}
+
+# 切图参数
+CROP_SIZE      = 1024   # 切图大小（像素），V100 16G 建议 1024
+CROP_STRIDE    = 512    # 滑窗步长（50% 重叠）
+MIN_AREA_RATIO = 0.2    # 目标框被裁剪后保留的最小面积比
 
 
+# ══════════════════════════════════════════════════
+#  1. 解析 DOTA 标注文件
+# ══════════════════════════════════════════════════
 def parse_dota_label(label_path: str) -> List[Dict]:
     """
     解析 DOTA 原始标注文件
 
-    Args:
-        label_path: 标注文件路径
-
     Returns:
         标注列表，每项包含：
         {
-            'poly': [x1,y1,x2,y2,x3,y3,x4,y4],
-            'class': class_name,
-            'difficulty': int
+            'poly': np.array (4,2),  # 四边形顶点，绝对像素坐标
+            'category': str,
+            'difficult': int
         }
     """
     annotations = []
@@ -57,6 +86,9 @@ def parse_dota_label(label_path: str) -> List[Dict]:
     with open(label_path, 'r', encoding='utf-8') as f:
         for line in f:
             line = line.strip()
+            # 跳过 DOTA 文件头（imagesource / gsd）
+            if line.startswith('imagesource') or line.startswith('gsd'):
+                continue
             if not line:
                 continue
 
@@ -64,299 +96,391 @@ def parse_dota_label(label_path: str) -> List[Dict]:
             if len(parts) < 9:
                 continue
 
-            # 解析多边形坐标
-            poly = [float(x) for x in parts[:8]]
-            class_name = parts[8]
-            difficulty = int(parts[9]) if len(parts) > 9 else 0
+            try:
+                coords = list(map(float, parts[:8]))
+                class_name = parts[8].lower()
+                difficulty = int(parts[9]) if len(parts) > 9 else 0
+            except ValueError:
+                continue
 
+            if KEEP_CLASSES and class_name not in KEEP_CLASSES:
+                continue
+            if class_name not in CATEGORY_MAP:
+                continue
+
+            poly = np.array(coords, dtype=np.float32).reshape(4, 2)
             annotations.append({
-                'poly': poly,
-                'class': class_name,
-                'difficulty': difficulty
+                'poly':      poly,
+                'category':  class_name,
+                'difficult': difficulty
             })
 
     return annotations
 
 
-def poly2rbox(poly: np.ndarray, img_w: int, img_h: int) -> Tuple[float, float, float, float, float]:
+# ══════════════════════════════════════════════════
+#  2. 切图 + 标注裁剪
+# ══════════════════════════════════════════════════
+def polygon_area(poly: np.ndarray) -> float:
+    """Shoelace 公式计算多边形面积"""
+    n = len(poly)
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += poly[i][0] * poly[j][1]
+        area -= poly[j][0] * poly[i][1]
+    return abs(area) / 2.0
+
+
+def clip_polygon_to_box(poly: np.ndarray, x0, y0, x1, y1) -> Optional[np.ndarray]:
     """
-    将多边形转换为旋转框 (归一化)
-
-    Args:
-        poly: [x1, y1, x2, y2, x3, y3, x4, y4]
-        img_w, img_h: 图像宽高
-
-    Returns:
-        (cx_norm, cy_norm, w_norm, h_norm, angle)
+    用 Sutherland-Hodgman 算法将多边形裁剪到矩形框 [x0,x1]×[y0,y1]。
+    返回裁剪后顶点数组，若结果为空则返回 None。
     """
-    poly_pts = np.array(poly).reshape(4, 2)
+    def inside(p, edge):
+        return (edge[2] - edge[0]) * (p[1] - edge[1]) - \
+               (edge[3] - edge[1]) * (p[0] - edge[0]) >= 0
 
-    # 计算最小外接矩形
-    rect = cv2.minAreaRect(poly_pts.astype(np.float32))
-    (cx, cy), (w, h), angle = rect
+    def intersection(p1, p2, edge):
+        x1_, y1_ = p1
+        x2_, y2_ = p2
+        ex1, ey1, ex2, ey2 = edge
+        dx, dy = x2_ - x1_, y2_ - y1_
+        edx, edy = ex2 - ex1, ey2 - ey1
+        denom = dx * edy - dy * edx
+        if abs(denom) < 1e-10:
+            return p1
+        t = ((ex1 - x1_) * edy - (ey1 - y1_) * edx) / denom
+        return [x1_ + t * dx, y1_ + t * dy]
 
-    # 归一化
-    cx_norm = cx / img_w
-    cy_norm = cy / img_h
-    w_norm = w / img_w
-    h_norm = h / img_h
+    edges = [
+        (x0, y0, x1, y0),  # 上边
+        (x1, y0, x1, y1),  # 右边
+        (x1, y1, x0, y1),  # 下边
+        (x0, y1, x0, y0),  # 左边
+    ]
 
-    # 角度转换 (DOTA 的角度定义)
-    # OpenCV 返回的角度范围是 [-90, 0)，需要转换为 [0, π/2)
-    angle_rad = np.radians(angle)
+    output = poly.tolist()
+    for edge in edges:
+        if not output:
+            return None
+        inp = output
+        output = []
+        for idx in range(len(inp)):
+            cur = inp[idx]
+            prev = inp[idx - 1]
+            if inside(cur, edge):
+                if not inside(prev, edge):
+                    output.append(intersection(prev, cur, edge))
+                output.append(cur)
+            elif inside(prev, edge):
+                output.append(intersection(prev, cur, edge))
 
-    # YOLO-OBB 的角度定义：从 x 轴正方向逆时针旋转
-    # 需要调整角度到 [-π/4, 3π/4) 范围
-    if angle < -45:
-        angle = angle + 90
-    angle_rad = np.radians(angle)
-
-    return cx_norm, cy_norm, w_norm, h_norm, angle_rad
+    if len(output) < 3:
+        return None
+    return np.array(output, dtype=np.float32)
 
 
-def convert_label(
-    label_path: str,
-    output_path: str,
-    img_w: int,
-    img_h: int,
+def crop_image_and_labels(
+    img: np.ndarray,
+    annotations: List[Dict],
+    crop_size: int,
+    stride: int
+) -> List[Tuple]:
+    """
+    对大图进行滑窗切割。
+    返回列表，每个元素为 (crop_img, crop_annotations, x_offset, y_offset)。
+    """
+    h, w = img.shape[:2]
+    crops = []
+
+    x_starts = list(range(0, max(w - crop_size, 0) + 1, stride))
+    y_starts = list(range(0, max(h - crop_size, 0) + 1, stride))
+
+    # 补充覆盖右/下边缘的最后一个窗口
+    if not x_starts or x_starts[-1] + crop_size < w:
+        x_starts.append(max(w - crop_size, 0))
+    if not y_starts or y_starts[-1] + crop_size < h:
+        y_starts.append(max(h - crop_size, 0))
+
+    for y0 in y_starts:
+        for x0 in x_starts:
+            x1_win = x0 + crop_size
+            y1_win = y0 + crop_size
+
+            crop = img[y0:y1_win, x0:x1_win].copy()
+            actual_h, actual_w = crop.shape[:2]
+            if actual_h < crop_size or actual_w < crop_size:
+                padded = np.zeros((crop_size, crop_size, 3), dtype=np.uint8)
+                padded[:actual_h, :actual_w] = crop
+                crop = padded
+
+            crop_annots = []
+            for ann in annotations:
+                poly_abs = ann['poly'].copy()
+
+                # 平移到切图坐标系
+                poly_crop = poly_abs - np.array([x0, y0], dtype=np.float32)
+
+                orig_area = polygon_area(poly_abs)
+                if orig_area < 1e-6:
+                    continue
+
+                clipped_poly = clip_polygon_to_box(poly_crop, 0, 0, crop_size, crop_size)
+                if clipped_poly is None:
+                    continue
+
+                clipped_area = polygon_area(clipped_poly)
+                if clipped_area / orig_area < MIN_AREA_RATIO:
+                    continue
+
+                # 用最小外接旋转矩形的四顶点作为最终标注
+                clipped_pts = clipped_poly.astype(np.float32)
+                rect = cv2.minAreaRect(clipped_pts)
+                box_pts = cv2.boxPoints(rect)          # shape (4,2)，顺时针
+                box_pts = np.clip(box_pts, 0, crop_size - 1)
+
+                crop_annots.append({
+                    'category':  ann['category'],
+                    'difficult': ann['difficult'],
+                    'poly':      box_pts
+                })
+
+            crops.append((crop, crop_annots, x0, y0))
+
+    return crops
+
+
+# ══════════════════════════════════════════════════
+#  3. 保存切图及 YOLOv8-OBB 格式标注
+# ══════════════════════════════════════════════════
+def save_crop(
+    crop_img: np.ndarray,
+    crop_annots: List[Dict],
+    img_save_path: str,
+    lbl_save_path: str,
     skip_difficult: bool = True
-) -> int:
-    """
-    转换单个标注文件
-
-    Args:
-        label_path: DOTA 标注文件路径
-        output_path: 输出 YOLO 格式标注路径
-        img_w, img_h: 对应图像的宽高
-        skip_difficult: 是否跳过困难样本
-
-    Returns:
-        转换的标注数量
-    """
-    annotations = parse_dota_label(label_path)
-
-    yolo_labels = []
-
-    for ann in annotations:
-        if skip_difficult and ann['difficulty'] != 0:
-            continue
-
-        class_name = ann['class']
-        if class_name not in CLASS_TO_ID:
-            continue
-
-        class_id = CLASS_TO_ID[class_name]
-        poly = np.array(ann['poly'])
-
-        try:
-            cx, cy, w, h, angle = poly2rbox(poly, img_w, img_h)
-
-            # 过滤无效标注
-            if w <= 0 or h <= 0:
-                continue
-            if not (0 <= cx <= 1 and 0 <= cy <= 1):
-                continue
-
-            yolo_labels.append(f"{class_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f} {angle:.6f}")
-
-        except Exception as e:
-            print(f"转换失败 {label_path}: {e}")
-            continue
-
-    # 写入文件
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(output_path, 'w') as f:
-        for label in yolo_labels:
-            f.write(label + '\n')
-
-    return len(yolo_labels)
-
-
-def prepare_dota(
-    dataset_root: str = './data/datasets/DOTA',
-    output_format: str = 'yolo-obb',
-    image_size: Tuple[int, int] = (1024, 1024),
-    skip_difficult: bool = True,
-    clean_existing: bool = False
 ) -> None:
     """
-    准备 DOTA 数据集
+    保存切图和对应的 YOLOv8-OBB 格式标注 txt。
+
+    YOLOv8-OBB 格式（每行）：
+      class_id  x1 y1  x2 y2  x3 y3  x4 y4
+    所有坐标均归一化到 [0, 1]。
+    """
+    cv2.imwrite(img_save_path, crop_img)
+
+    h, w = crop_img.shape[:2]
+    lines = []
+    for ann in crop_annots:
+        if skip_difficult and ann['difficult'] != 0:
+            continue
+
+        cls_id = CATEGORY_MAP[ann['category']]
+        poly_norm = ann['poly'].copy().astype(np.float64)
+        poly_norm[:, 0] /= w
+        poly_norm[:, 1] /= h
+        poly_norm = np.clip(poly_norm, 0.0, 1.0)
+
+        coords_str = ' '.join(f'{v:.6f}' for v in poly_norm.flatten())
+        lines.append(f'{cls_id} {coords_str}')
+
+    with open(lbl_save_path, 'w') as f:
+        f.write('\n'.join(lines))
+
+
+# ══════════════════════════════════════════════════
+#  4. 主函数
+# ══════════════════════════════════════════════════
+def prepare_dota(
+    raw_image_dir: str = RAW_IMAGE_DIR,
+    raw_label_dir: str = RAW_LABEL_DIR,
+    output_dir: str = OUTPUT_DIR,
+    crop_size: int = CROP_SIZE,
+    crop_stride: int = CROP_STRIDE,
+    skip_difficult: bool = True,
+    clean_existing: bool = False,
+    random_seed: int = 42
+) -> None:
+    """
+    准备 DOTA 数据集（滑窗切图 + YOLOv8-OBB 四顶点格式）
+
+    目录约定（与 data_prepare.py 完全一致）：
+      raw_image_dir/   ← 原始大图，如 P0001.png
+      raw_label_dir/   ← DOTA 标注，如 P0001.txt
+      output_dir/
+        images/{train,val,test}/
+        labels/{train,val,test}/
+        data.yaml
 
     Args:
-        dataset_root: 数据集根目录
-        output_format: 输出格式 ('yolo-obb')
-        image_size: 目标图像尺寸 (宽，高)
+        raw_image_dir:  原始大图目录
+        raw_label_dir:  DOTA 标注目录（labelTxt 格式）
+        output_dir:     输出根目录
+        crop_size:      切图大小（像素）
+        crop_stride:    滑窗步长
         skip_difficult: 是否跳过困难样本
         clean_existing: 是否清理已存在的输出目录
+        random_seed:    随机种子，用于 train/val/test 划分
     """
-    dataset_root = Path(dataset_root)
+    random.seed(random_seed)
 
-    # 输入目录
-    if (dataset_root / 'origin').exists():
-        origin_root = dataset_root / 'origin'
-    else:
-        # 尝试其他可能的目录结构
-        origin_root = dataset_root
+    raw_img_dir = Path(raw_image_dir)
+    raw_lbl_dir = Path(raw_label_dir)
+    output_dir  = Path(output_dir)
 
-    # 输出目录
-    yolo_root = dataset_root / 'yolo_obb'
+    if clean_existing and output_dir.exists():
+        shutil.rmtree(output_dir)
 
-    if clean_existing and yolo_root.exists():
-        shutil.rmtree(yolo_root)
+    # 临时目录（切图后统一划分）
+    tmp_img_dir = output_dir / '_tmp_images'
+    tmp_lbl_dir = output_dir / '_tmp_labels'
+    tmp_img_dir.mkdir(parents=True, exist_ok=True)
+    tmp_lbl_dir.mkdir(parents=True, exist_ok=True)
 
-    yolo_root.mkdir(parents=True, exist_ok=True)
+    img_extensions = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
+    all_img_paths = sorted([
+        p for p in raw_img_dir.iterdir()
+        if p.suffix.lower() in img_extensions
+    ])
+    print(f'[INFO] 共找到 {len(all_img_paths)} 张原始图像')
 
-    splits = ['train', 'val']
+    all_stems = []
 
-    for split in splits:
-        print(f"\n处理 {split} 集...")
-
-        # 目录结构
-        split_images = yolo_root / split / 'images'
-        split_labels = yolo_root / split / 'labels'
-        split_images.mkdir(parents=True, exist_ok=True)
-        split_labels.mkdir(parents=True, exist_ok=True)
-
-        # 查找图像和标注目录
-        if (origin_root / 'train' / 'images').exists():
-            images_dir = origin_root / split / 'images'
-            labels_dir = origin_root / split / 'labels'
-        elif (origin_root / 'images').exists():
-            images_dir = origin_root / 'images'
-            labels_dir = origin_root / 'labels'
-        else:
-            # 尝试 DOTA 原始解压目录
-            images_dir = origin_root / split
-            labels_dir = origin_root / f'{split}_labelTxt'
-
-        if not images_dir.exists():
-            print(f"  警告：找不到 {split} 图像目录")
+    for img_path in tqdm(all_img_paths, desc='切图进度'):
+        # 查找标注文件（兼容 .txt / .Txt）
+        lbl_path = raw_lbl_dir / f'{img_path.stem}.txt'
+        if not lbl_path.exists():
+            lbl_path = raw_lbl_dir / f'{img_path.stem}.Txt'
+        if not lbl_path.exists():
+            print(f'[WARN] 标注文件不存在，跳过：{img_path.stem}')
             continue
 
-        if not labels_dir.exists():
-            print(f"  警告：找不到 {split} 标注目录")
+        img = cv2.imread(str(img_path))
+        if img is None:
+            print(f'[WARN] 无法读取图像，跳过：{img_path}')
             continue
 
-        # 处理每个样本
-        image_extensions = ['.png', '.jpg', '.jpeg', '.tif', '.bmp']
-        total_images = 0
-        total_annotations = 0
+        annotations = parse_dota_label(str(lbl_path))
+        crops = crop_image_and_labels(img, annotations, crop_size, crop_stride)
 
-        for img_path in images_dir.glob('*'):
-            if img_path.suffix.lower() not in image_extensions:
+        for crop_img, crop_annots, x0, y0 in crops:
+            # 跳过无有效标注的切图（如需保留背景片可注释此行）
+            valid_annots = [
+                a for a in crop_annots
+                if not (skip_difficult and a['difficult'] != 0)
+            ]
+            if not valid_annots:
                 continue
 
-            total_images += 1
-
-            # 读取图像尺寸
-            try:
-                img = cv2.imread(str(img_path))
-                if img is None:
-                    continue
-                orig_h, orig_w = img.shape[:2]
-            except Exception as e:
-                print(f"  读取图像失败 {img_path}: {e}")
-                continue
-
-            # 复制图像 (可选：这里可以添加图像裁剪/缩放逻辑)
-            dst_img_path = split_images / f"{img_path.stem}.png"
-            if image_size is not None:
-                # 缩放到目标尺寸
-                img_resized = cv2.resize(img, image_size, interpolation=cv2.INTER_LINEAR)
-                cv2.imwrite(str(dst_img_path), img_resized)
-            else:
-                shutil.copy(img_path, dst_img_path)
-
-            # 查找对应标注文件
-            label_path = labels_dir / f"{img_path.stem}.txt"
-            if not label_path.exists():
-                # 尝试其他可能的标注文件扩展名
-                label_path = labels_dir / f"{img_path.stem}.Txt"
-
-            if not label_path.exists():
-                continue
-
-            # 转换标注
-            dst_label_path = split_labels / f"{img_path.stem}.txt"
-
-            if image_size is not None:
-                new_w, new_h = image_size
-            else:
-                new_w, new_h = orig_w, orig_h
-
-            num_anns = convert_label(
-                str(label_path),
-                str(dst_label_path),
-                new_w,
-                new_h,
+            stem = f'{img_path.stem}__cx{x0}_cy{y0}'
+            img_save = tmp_img_dir / f'{stem}.jpg'
+            lbl_save = tmp_lbl_dir / f'{stem}.txt'
+            save_crop(
+                crop_img, crop_annots,
+                str(img_save), str(lbl_save),
                 skip_difficult=skip_difficult
             )
+            all_stems.append(stem)
 
-            total_annotations += num_anns
+    print(f'[INFO] 切图完成，共生成 {len(all_stems)} 张有效切图')
 
-        print(f"  完成：{total_images} 张图像，{total_annotations} 个标注")
+    # ── 随机划分 train / val / test ────────────────
+    random.shuffle(all_stems)
+    n = len(all_stems)
+    n_train = int(n * SPLIT_RATIO['train'])
+    n_val   = int(n * SPLIT_RATIO['val'])
 
-    # 创建数据集 YAML 配置
-    create_dataset_yaml(yolo_root, dataset_root)
+    splits = {
+        'train': all_stems[:n_train],
+        'val':   all_stems[n_train:n_train + n_val],
+        'test':  all_stems[n_train + n_val:]
+    }
 
-    print(f"\n数据集准备完成！")
-    print(f"输出目录：{yolo_root}")
+    for split, stems in splits.items():
+        (output_dir / 'images' / split).mkdir(parents=True, exist_ok=True)
+        (output_dir / 'labels' / split).mkdir(parents=True, exist_ok=True)
+        for stem in tqdm(stems, desc=f'复制 {split} 集'):
+            shutil.copy(
+                tmp_img_dir / f'{stem}.jpg',
+                output_dir / 'images' / split / f'{stem}.jpg'
+            )
+            shutil.copy(
+                tmp_lbl_dir / f'{stem}.txt',
+                output_dir / 'labels' / split / f'{stem}.txt'
+            )
+        print(f'[INFO] {split}: {len(stems)} 张')
 
+    # 清理临时目录
+    shutil.rmtree(tmp_img_dir)
+    shutil.rmtree(tmp_lbl_dir)
 
-def create_dataset_yaml(yolo_root: Path, dataset_root: Path) -> None:
-    """创建 YOLO 数据集配置文件"""
+    # ── 生成 data.yaml ─────────────────────────────
+    create_dataset_yaml(output_dir)
 
-    yaml_content = f"""# DOTA dataset for YOLO-OBB
-path: {dataset_root.absolute()}
-train: yolo_obb/train/images
-val: yolo_obb/val/images
-
-# 类别定义
-names:
-  0: plane
-  1: baseball-diamond
-  2: bridge
-  3: ground-track-field
-  4: small-vehicle
-  5: large-vehicle
-  6: ship
-  7: tennis-court
-  8: basketball-court
-  9: storage-tank
-  10: soccer-ball-field
-  11: roundabout
-  12: harbor
-  13: swimming-pool
-  14: helicopter
-
-nc: 15
-"""
-
-    yaml_path = yolo_root / 'dataset.yaml'
-    with open(yaml_path, 'w') as f:
-        f.write(yaml_content)
-
-    print(f"数据集配置已保存到：{yaml_path}")
+    print(f'\n[INFO] 数据集准备完成！输出目录：{output_dir}')
+    print(f'       train: {len(splits["train"])}  '
+          f'val: {len(splits["val"])}  '
+          f'test: {len(splits["test"])}')
 
 
+def create_dataset_yaml(output_dir: Path) -> None:
+    """生成 YOLOv8 数据集配置文件"""
+    nc = len(CATEGORY_MAP)
+    names_list = [k for k, _ in sorted(CATEGORY_MAP.items(), key=lambda x: x[1])]
+
+    data_yaml = {
+        'path':  str(output_dir.resolve()),
+        'train': 'images/train',
+        'val':   'images/val',
+        'test':  'images/test',
+        'nc':    nc,
+        'names': names_list
+    }
+
+    yaml_path = output_dir / 'data.yaml'
+    with open(yaml_path, 'w', encoding='utf-8') as f:
+        yaml.dump(data_yaml, f, allow_unicode=True, default_flow_style=False)
+
+    print(f'[INFO] data.yaml 已生成：{yaml_path}')
+
+
+# ══════════════════════════════════════════════════
+#  命令行入口
+# ══════════════════════════════════════════════════
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='预处理 DOTA 数据集')
+    parser = argparse.ArgumentParser(description='预处理 DOTA 数据集（YOLOv8-OBB 四顶点格式）')
     parser.add_argument(
-        '--root',
+        '--image-dir',
         type=str,
-        default='./data/datasets/DOTA',
-        help='数据集根目录'
+        default=RAW_IMAGE_DIR,
+        help=f'原始大图目录（默认：{RAW_IMAGE_DIR}）'
     )
     parser.add_argument(
-        '--image-size',
+        '--label-dir',
+        type=str,
+        default=RAW_LABEL_DIR,
+        help=f'DOTA 标注目录（默认：{RAW_LABEL_DIR}）'
+    )
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default=OUTPUT_DIR,
+        help=f'输出根目录（默认：{OUTPUT_DIR}）'
+    )
+    parser.add_argument(
+        '--crop-size',
         type=int,
-        nargs=2,
-        default=[1024, 1024],
-        help='目标图像尺寸 [宽，高]'
+        default=CROP_SIZE,
+        help=f'切图大小（像素），默认 {CROP_SIZE}'
+    )
+    parser.add_argument(
+        '--crop-stride',
+        type=int,
+        default=CROP_STRIDE,
+        help=f'滑窗步长，默认 {CROP_STRIDE}（50%% 重叠）'
     )
     parser.add_argument(
         '--no-skip-difficult',
@@ -368,12 +492,22 @@ if __name__ == '__main__':
         action='store_true',
         help='清理已存在的输出目录'
     )
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=42,
+        help='随机种子'
+    )
 
     args = parser.parse_args()
 
     prepare_dota(
-        dataset_root=args.root,
-        image_size=tuple(args.image_size),
+        raw_image_dir=args.image_dir,
+        raw_label_dir=args.label_dir,
+        output_dir=args.output_dir,
+        crop_size=args.crop_size,
+        crop_stride=args.crop_stride,
         skip_difficult=not args.no_skip_difficult,
-        clean_existing=args.clean
+        clean_existing=args.clean,
+        random_seed=args.seed
     )
